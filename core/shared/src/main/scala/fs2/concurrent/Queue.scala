@@ -1,9 +1,9 @@
 package fs2
 package concurrent
 
-import cats.{Applicative, Eq, Functor, Id}
 import cats.effect.{Concurrent, Sync}
 import cats.implicits._
+import cats.{Applicative, Eq, Functor, Id}
 import fs2.internal.Token
 
 import scala.collection.immutable.{Queue => ScalaQueue}
@@ -321,18 +321,24 @@ object Queue {
   private[fs2] object Strategy {
 
     /** Unbounded fifo strategy. */
-    def boundedFifo[A](maxSize: Int): PubSub.Strategy[A, Chunk[A], ScalaQueue[A], Int] =
-      PubSub.Strategy.bounded(maxSize)(fifo[A])(_.size)
+    def boundedFifo[A](maxSize: Int): PubSub.Strategy[A, Chunk[A], SizedQueue[A], Int] =
+      PubSub.Strategy.bounded(maxSize)(sizedFifo[A])(_.size)
+
+    private def sizedFifo[A]: PubSub.Strategy[A, Chunk[A], SizedQueue[A], Int] =
+      sized((q, a) => new SizedQueue(q.queue :+ a, q.size + 1))
 
     /** Unbounded lifo strategy. */
-    def boundedLifo[A](maxSize: Int): PubSub.Strategy[A, Chunk[A], ScalaQueue[A], Int] =
-      PubSub.Strategy.bounded(maxSize)(lifo[A])(_.size)
+    def boundedLifo[A](maxSize: Int): PubSub.Strategy[A, Chunk[A], SizedQueue[A], Int] =
+      PubSub.Strategy.bounded(maxSize)(sizedLifo[A])(_.size)
+
+    private def sizedLifo[A]: PubSub.Strategy[A, Chunk[A], SizedQueue[A], Int] =
+      sized((q, a) => new SizedQueue(a +: q.queue, q.size + 1))
 
     /** Strategy for circular buffer, which stores the last `maxSize` enqueued elements and never blocks on enqueue. */
-    def circularBuffer[A](maxSize: Int): PubSub.Strategy[A, Chunk[A], ScalaQueue[A], Int] =
-      unbounded { (q, a) =>
-        if (q.size < maxSize) q :+ a
-        else q.tail :+ a
+    def circularBuffer[A](maxSize: Int): PubSub.Strategy[A, Chunk[A], SizedQueue[A], Int] =
+      sized { (q, a) =>
+        if (q.size < maxSize) new SizedQueue(q.queue :+ a, q.size + 1)
+        else new SizedQueue(q.queue.tail :+ a, q.size)
       }
 
     /** Unbounded lifo strategy. */
@@ -406,6 +412,37 @@ object Queue {
         def unsubscribe(selector: Int, queueState: ScalaQueue[A]): ScalaQueue[A] =
           queueState
       }
+
+    private def sized[A](append: (SizedQueue[A], A) => SizedQueue[A])
+      : PubSub.Strategy[A, Chunk[A], SizedQueue[A], Int] =
+      new PubSub.Strategy[A, Chunk[A], SizedQueue[A], Int] {
+
+        val initial: SizedQueue[A] = new SizedQueue(ScalaQueue.empty, 0)
+
+        def publish(a: A, queueState: SizedQueue[A]): SizedQueue[A] =
+          append(queueState, a)
+
+        def accepts(i: A, queueState: SizedQueue[A]): Boolean =
+          true
+
+        def empty(queueState: SizedQueue[A]): Boolean =
+          queueState.size == 0
+
+        def get(selector: Int, queueState: SizedQueue[A]): (SizedQueue[A], Option[Chunk[A]]) =
+          if (queueState.size == 0) (queueState, None)
+          else {
+            val (out, rem) = Chunk.queueFirstN(queueState.queue, selector)
+            (new SizedQueue(rem, queueState.size - out.size), Some(out))
+          }
+
+        def subscribe(selector: Int, queueState: SizedQueue[A]): (SizedQueue[A], Boolean) =
+          (queueState, false)
+
+        def unsubscribe(selector: Int, queueState: SizedQueue[A]): SizedQueue[A] =
+          queueState
+      }
+
+    final class SizedQueue[A](val queue: ScalaQueue[A], val size: Int)
   }
 }
 
@@ -447,12 +484,12 @@ object InspectableQueue {
 
     /** Creates a queue with the specified size bound. */
     def bounded[F[_], A](maxSize: Int)(implicit F: Concurrent[F]): G[InspectableQueue[F, A]] =
-      forStrategy(Queue.Strategy.boundedFifo[A](maxSize))(_.headOption)(_.size)
+      forStrategy(Queue.Strategy.boundedFifo[A](maxSize))(_.queue.headOption)(_.size)
 
     /** Creates a queue which stores the last `maxSize` enqueued elements and which never blocks on enqueue. */
     def circularBuffer[F[_], A](maxSize: Int)(
         implicit F: Concurrent[F]): G[InspectableQueue[F, A]] =
-      forStrategy(Queue.Strategy.circularBuffer[A](maxSize))(_.headOption)(_.size)
+      forStrategy(Queue.Strategy.circularBuffer[A](maxSize))(_.queue.headOption)(_.size)
 
     private[fs2] def forStrategy[F[_]: Concurrent, S, A](
         strategy: PubSub.Strategy[A, Chunk[A], S, Int]
